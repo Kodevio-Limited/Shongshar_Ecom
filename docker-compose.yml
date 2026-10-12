@@ -1,0 +1,268 @@
+# Shonsher — single deployment (frontend + backend + postgres + redis) on Dokploy
+#
+# TWO public domains on shonsher.kodevio.com:
+#
+#   FRONTEND  -> https://shonsher.kodevio.com
+#   BACKEND   -> https://shonsherbackend.kodevio.com   (API + Django admin at /admin/)
+#
+# How it works:
+#   - frontend/backend join "dokploy-network" so Traefik routes to them.
+#   - The storefront calls the API directly at https://shonsherbackend.kodevio.com
+#     (same-site subdomains of shonsher.kodevio.com, so the HttpOnly refresh cookie uses
+#     SameSite=Lax; Django CORS allows the frontend origin).
+#   - Postgres ("db") and Redis ("redis") are INTERNAL ONLY (no Traefik labels).
+#     Data lives on the "postgres_data" volume and survives redeploys.
+#   - Uploads live on the "media_data" volume and survive redeploys.
+#
+# ── LOAD BALANCING ───────────────────────────────────────────────────────────
+#   Traefik (already running in Dokploy) IS the load balancer. Increasing
+#   `deploy.replicas` on the backend/frontend services spins up more containers
+#   that Traefik fans requests across and health-checks out of rotation.
+#   (Container names are intentionally NOT set on the scalable services, since
+#   a fixed container_name prevents `--scale`.)
+#
+# Required env vars in Dokploy (compose service -> Environment):
+#   SECRET_KEY=<long random string>
+#   POSTGRES_PASSWORD=<strong db password>   (single source of DB credentials)
+#   ADMIN_USERNAME=<admin username>
+#   ADMIN_EMAIL=<admin email>
+#   ADMIN_PASSWORD=<admin password>
+#   ADMIN_RESET_PASSWORD=0                    (leave 0; set 1 for one deploy to
+#                                              force-reset the admin password)
+#
+# Optional (defaults shown):
+#   POSTGRES_DB=shonsher  POSTGRES_USER=shonsher
+#   ALLOWED_HOSTS=shonsher.kodevio.com,shonsherbackend.kodevio.com
+#   CORS_ALLOWED_ORIGINS=https://shonsher.kodevio.com
+#   CSRF_TRUSTED_ORIGINS=https://shonsher.kodevio.com,https://shonsherbackend.kodevio.com
+#   FRONTEND_URL=https://shonsher.kodevio.com
+#   REDIS_URL=redis://redis:6379/0
+#   DELIVERY_CHARGE_INSIDE=60  DELIVERY_CHARGE_OUTSIDE=120
+#   THROTTLE_ORDER=10/hour     MAX_OPEN_ORDERS=1
+#
+# Before deploying:
+#   1. DNS A records on shonsher.kodevio.com pointing to your server IP:
+#        shonsher          -> server IP
+#        shonsherbackend   -> server IP
+#   2. Push this project directory to its git repo.
+#   3. Deploy this file as a "Docker Compose" service in Dokploy.
+#   4. NEVER delete the postgres_data / media_data volumes unless you
+#      intend to wipe all users, orders and uploads.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-shonsher}
+      POSTGRES_USER: ${POSTGRES_USER:-shonsher}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Dokploy environment}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Shared cache for rate limiting / sessions across backend replicas.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-shot schema migration + admin bootstrap. Runs to completion BEFORE any
+  # backend replica starts, so replicas never race each other on migrations.
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.prod
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in the Dokploy environment}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_RESET_PASSWORD: ${ADMIN_RESET_PASSWORD:-0}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-shonsher.kodevio.com,shonsherbackend.kodevio.com}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://shonsher.kodevio.com}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-https://shonsher.kodevio.com,https://shonsherbackend.kodevio.com}
+      FRONTEND_URL: ${FRONTEND_URL:-https://shonsher.kodevio.com}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-shonsher}
+      DB_USER: ${POSTGRES_USER:-shonsher}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Dokploy environment}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    command: >
+      sh -c "python manage.py migrate --noinput --settings=core.settings.prod &&
+             python manage.py ensure_admin --settings=core.settings.prod &&
+             python manage.py collectstatic --noinput --settings=core.settings.prod"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend-net
+
+  # One-shot fix-up for the shared media volume (root-owned volume -> 500 on
+  # upload). Runs as root, makes /app/media writable by "app", exits.
+  media-init:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    user: root
+    command: >
+      sh -c "mkdir -p /app/media/products /app/media/categories /app/media/banners &&
+             chown -R app:app /app/media &&
+             echo 'media volume owned by app:app'"
+    volumes:
+      - media_data:/app/media
+    networks:
+      - backend-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Give Gunicorn time for a graceful drain (gunicorn.conf.py graceful_timeout
+    # is 30s). Docker's default 10s would SIGKILL mid-request.
+    stop_grace_period: 40s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 768M
+        reservations:
+          memory: 256M
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.prod
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in the Dokploy environment}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-shonsher.kodevio.com,shonsherbackend.kodevio.com}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://shonsher.kodevio.com}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-https://shonsher.kodevio.com,https://shonsherbackend.kodevio.com}
+      FRONTEND_URL: ${FRONTEND_URL:-https://shonsher.kodevio.com}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-shonsher}
+      DB_USER: ${POSTGRES_USER:-shonsher}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Dokploy environment}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      THROTTLE_ORDER: ${THROTTLE_ORDER:-10/hour}
+      MAX_OPEN_ORDERS: ${MAX_OPEN_ORDERS:-1}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-8}
+      # Schema + admin bootstrap are owned by the "migrate" service above.
+      MIGRATE_ON_BOOT: "0"
+      BOOTSTRAP_ON_BOOT: "0"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      media-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+    networks:
+      - backend-net
+      - dokploy-network
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy-network
+
+      # HTTPS router -> shonsherbackend.kodevio.com (API + /admin/)
+      - traefik.http.routers.shonsher-backend.rule=Host(`shonsherbackend.kodevio.com`)
+      - traefik.http.routers.shonsher-backend.entrypoints=websecure
+      - traefik.http.routers.shonsher-backend.tls.certResolver=letsencrypt
+
+      # HTTP -> HTTPS redirect (middleware name is unique per project so it
+      # never collides with another kodevio.com stack on the same Traefik)
+      - traefik.http.routers.shonsher-backend-http.rule=Host(`shonsherbackend.kodevio.com`)
+      - traefik.http.routers.shonsher-backend-http.entrypoints=web
+      - traefik.http.routers.shonsher-backend-http.middlewares=shonsher-backend-https
+      - traefik.http.middlewares.shonsher-backend-https.redirectscheme.scheme=https
+      - traefik.http.middlewares.shonsher-backend-https.redirectscheme.permanent=true
+
+      # Backend port + health-checked load balancing
+      - traefik.http.services.shonsher-backend.loadbalancer.server.port=8000
+      - traefik.http.services.shonsher-backend.loadbalancer.healthcheck.path=/api/health/
+      - traefik.http.services.shonsher-backend.loadbalancer.healthcheck.interval=15s
+      - traefik.http.services.shonsher-backend.loadbalancer.healthcheck.timeout=5s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://shonsherbackend.kodevio.com}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+    environment:
+      - NODE_ENV=production
+    healthcheck:
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "fetch('http://127.0.0.1:3000/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - backend
+    networks:
+      - backend-net
+      - dokploy-network
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy-network
+
+      # HTTPS router -> shonsher.kodevio.com
+      - traefik.http.routers.shonsher-frontend.rule=Host(`shonsher.kodevio.com`)
+      - traefik.http.routers.shonsher-frontend.entrypoints=websecure
+      - traefik.http.routers.shonsher-frontend.tls.certResolver=letsencrypt
+
+      # HTTP -> HTTPS redirect (uniquely named; see backend above)
+      - traefik.http.routers.shonsher-frontend-http.rule=Host(`shonsher.kodevio.com`)
+      - traefik.http.routers.shonsher-frontend-http.entrypoints=web
+      - traefik.http.routers.shonsher-frontend-http.middlewares=shonsher-frontend-https
+      - traefik.http.middlewares.shonsher-frontend-https.redirectscheme.scheme=https
+      - traefik.http.middlewares.shonsher-frontend-https.redirectscheme.permanent=true
+
+      # Next.js port + health-checked load balancing
+      - traefik.http.services.shonsher-frontend.loadbalancer.server.port=3000
+      - traefik.http.services.shonsher-frontend.loadbalancer.healthcheck.path=/api/health
+      - traefik.http.services.shonsher-frontend.loadbalancer.healthcheck.interval=15s
+      - traefik.http.services.shonsher-frontend.loadbalancer.healthcheck.timeout=5s
+
+volumes:
+  postgres_data:
+  media_data:
+
+networks:
+  backend-net:
+  dokploy-network:
+    external: true
