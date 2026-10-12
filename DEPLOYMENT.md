@@ -126,7 +126,7 @@ log instead of being delivered (ordering is never blocked either way).
 
 `DELIVERY_CHARGE_INSIDE/OUTSIDE` (60/120), `JWT_ACCESS_TOKEN_LIFETIME_MINUTES` (60),
 `JWT_REFRESH_TOKEN_LIFETIME_DAYS` (7), `THROTTLE_ANON/USER/AUTH/ORDER/EMAIL_SEND`,
-`MAX_OPEN_ORDERS` (1), `GUNICORN_WORKERS` (4), `GUNICORN_THREADS` (8),
+`MAX_OPEN_ORDERS` (0), `GUNICORN_WORKERS` (4), `GUNICORN_THREADS` (8),
 `DB_CONN_MAX_AGE` (120), `REFRESH_COOKIE_*` (name/path/SameSite; `Secure` is
 forced on in production — do not override it off).
 
@@ -137,15 +137,12 @@ per user and shared across replicas via Redis.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MAX_OPEN_ORDERS` | `1` | Most orders still `pending`/`confirmed` at once; `409` above it. **`0` disables the cap.** |
-| `THROTTLE_ORDER` | `10/hour` | Max order placements per hour; `429` above it. |
+| `MAX_OPEN_ORDERS` | `0` | Most orders still `pending`/`confirmed` at once; `409` above it. **`0` disables the cap (Shonsher default).** |
+| `THROTTLE_ORDER` | `100/hour` | Max order placements per hour; `429` above it. |
 
-To let a registered user order as many as they want while keeping a safety net
-against a runaway script, set:
-```
-MAX_OPEN_ORDERS=0
-THROTTLE_ORDER=100/hour
-```
+Shonsher ships with multiple orders allowed (`MAX_OPEN_ORDERS=0`) and a
+`100/hour` runaway-script safety net. To make a single order at a time, set
+`MAX_OPEN_ORDERS=1`.
 Per-order quantity and number of products are already unlimited (bounded only by
 `Product.quantity` in stock). There is no guest checkout — every order is from a
 registered user, so these limits apply to all customers.

@@ -38,7 +38,7 @@
 #   FRONTEND_URL=https://shonsher.kodevio.com
 #   REDIS_URL=redis://redis:6379/0
 #   DELIVERY_CHARGE_INSIDE=60  DELIVERY_CHARGE_OUTSIDE=120
-#   THROTTLE_ORDER=10/hour     MAX_OPEN_ORDERS=1
+#   THROTTLE_ORDER=100/hour   MAX_OPEN_ORDERS=0   (multiple orders allowed)
 #
 # Before deploying:
 #   1. DNS A records on shonsher.kodevio.com pointing to your server IP:
@@ -162,8 +162,11 @@ services:
       DB_USER: ${POSTGRES_USER:-shonsher}
       DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Dokploy environment}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      THROTTLE_ORDER: ${THROTTLE_ORDER:-10/hour}
-      MAX_OPEN_ORDERS: ${MAX_OPEN_ORDERS:-1}
+      # COD abuse protection. Multiple orders per account are allowed
+      # (MAX_OPEN_ORDERS=0 disables the open-order cap); the hourly throttle
+      # remains a runaway-script safety net.
+      THROTTLE_ORDER: ${THROTTLE_ORDER:-100/hour}
+      MAX_OPEN_ORDERS: ${MAX_OPEN_ORDERS:-0}
       GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
       GUNICORN_THREADS: ${GUNICORN_THREADS:-8}
       # Schema + admin bootstrap are owned by the "migrate" service above.

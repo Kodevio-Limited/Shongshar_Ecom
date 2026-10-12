@@ -328,6 +328,14 @@ class OpenOrderCapTests(OrderIntegrityCase):
         self.assertEqual(self.place(key='').status_code, 201)
         self.assertEqual(self.place(key='').status_code, 409)
 
+    @override_settings(MAX_OPEN_ORDERS=0)
+    def test_zero_disables_the_cap_and_allows_many_orders(self):
+        # Shonsher default: a registered user may place as many orders as they
+        # want; only the hourly throttle remains.
+        for _ in range(4):
+            self.assertEqual(self.place(key='').status_code, 201)
+        self.assertEqual(Order.objects.count(), 4)
+
 
 class OrderPlacementThrottleTests(OrderIntegrityCase):
     def test_order_scope_is_configured_and_wired_to_the_view(self):
