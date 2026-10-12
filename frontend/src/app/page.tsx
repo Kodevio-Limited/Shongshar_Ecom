@@ -30,7 +30,7 @@ export default function HomePage() {
     <div className="flex flex-col min-h-screen bg-white">
       {/* Hero Banner Section */}
       <section className="w-full px-4 sm:px-6 md:px-[40px] lg:px-[80px] py-[10px]">
-        <div className="max-w-[1440px] mx-auto relative h-[200px] sm:h-[280px] md:h-[360px] bg-grad-hero rounded-[20px] overflow-hidden shadow-sm">
+        <div className="max-w-[1440px] mx-auto relative aspect-[16/9] sm:aspect-[2/1] md:aspect-[5/2] bg-grad-hero rounded-[20px] overflow-hidden shadow-sm">
           {banners && banners.length > 0 ? (
             <div className="relative w-full h-full">
               {banners.map((banner, index) => (
@@ -41,14 +41,32 @@ export default function HomePage() {
                     index === currentBanner ? "opacity-100 z-10" : "opacity-0 z-0"
                   )}
                 >
+                  {/* Blurred, cover-filled backdrop: fills the frame with the
+                      banner's own colours instead of hard letterbox bars, so a
+                      banner of ANY aspect ratio looks intentional. */}
+                  <Image
+                    src={getImageUrl(banner.image)}
+                    alt=""
+                    aria-hidden
+                    fill
+                    sizes="100vw"
+                    className="object-cover scale-110 blur-2xl"
+                  />
+                  {/* Scrim for text legibility over the blurred backdrop */}
+                  <div className="absolute inset-0 bg-navy/40" />
+                  {/* The banner itself, always fully visible (never cropped) */}
                   <Image
                     src={getImageUrl(banner.image)}
                     alt={banner.title}
                     fill
-                    className="object-cover"
+                    sizes="(min-width: 1440px) 1440px, 100vw"
+                    className="object-contain object-center"
                     priority={index === 0}
                   />
-                  <div className="absolute inset-0 bg-black/20 flex flex-col justify-center px-4 sm:px-6 md:px-[40px] lg:px-[80px]">
+                  {/* Keeps white overlay text legible even on bright banners */}
+                  <div className="absolute inset-0 bg-navy/25" />
+                  {/* Text overlay — constrained to the visible banner area */}
+                  <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-4 sm:px-6 md:px-[40px] lg:px-[80px]">
                     {banner.subtitle && (
                       <h2 className="text-orange-300 text-[14px] md:text-[16px] font-bold italic mb-1 uppercase tracking-widest drop-shadow-sm">
                         {banner.subtitle}
@@ -84,7 +102,7 @@ export default function HomePage() {
               )}
             </div>
           ) : (
-            <div className="w-full h-full flex flex-col justify-center px-4 sm:px-6 md:px-[40px] lg:px-[80px]">
+            <div className="w-full h-full flex flex-col justify-center items-center text-center px-4 sm:px-6 md:px-[40px] lg:px-[80px]">
               <h2 className="text-orange text-[14px] md:text-[16px] font-bold italic mb-1 uppercase tracking-widest">New Arrivals.</h2>
               <h1 className="text-white text-[32px] md:text-[44px] font-extrabold leading-[1.1] uppercase">
                 GADGET <br /> SALE
